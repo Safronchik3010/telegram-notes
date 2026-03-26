@@ -17,9 +17,9 @@ from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-TASKS_FILE  = BASE_DIR / "tasks.md"
-IDEAS_FILE  = BASE_DIR / "ideas.md"
-OFFSET_FILE = BASE_DIR / ".offset"
+TASKS_FILE       = BASE_DIR / "tasks.md"
+IDEAS_FILE       = BASE_DIR / "ideas.md"
+LAST_UPDATE_FILE = BASE_DIR / ".last_update_id"
 
 TASK_KEYWORDS = {
     "сделать", "купить", "написать", "позвонить", "отправить",
@@ -58,13 +58,15 @@ def get_token() -> str:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set in environment")
     return token
 
-def load_offset() -> int:
-    if OFFSET_FILE.exists():
-        return int(OFFSET_FILE.read_text().strip())
+def load_last_update_id() -> int:
+    """Read last processed update_id from .last_update_id file."""
+    if LAST_UPDATE_FILE.exists():
+        return int(LAST_UPDATE_FILE.read_text().strip())
     return 0
 
-def save_offset(offset: int):
-    OFFSET_FILE.write_text(str(offset))
+def save_last_update_id(update_id: int):
+    """Save last processed update_id so next run skips already-seen messages."""
+    LAST_UPDATE_FILE.write_text(str(update_id))
 
 def fetch_updates(token: str, offset: int) -> list:
     url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=5"
@@ -109,15 +111,17 @@ def main():
     ensure_file(TASKS_FILE, "Задачи")
     ensure_file(IDEAS_FILE,  "Идеи")
 
-    token   = get_token()
-    offset  = load_offset()
-    updates = fetch_updates(token, offset)
+    token         = get_token()
+    last_id       = load_last_update_id()
+    # Telegram API: offset = last_update_id + 1 → returns only NEW messages
+    offset        = last_id + 1 if last_id > 0 else 0
+    updates       = fetch_updates(token, offset)
 
-    n_tasks  = 0
-    n_ideas  = 0
-    n_voice  = 0
-    n_skip   = 0
-    max_update_id = offset - 1
+    n_tasks       = 0
+    n_ideas       = 0
+    n_voice       = 0
+    n_skip        = 0
+    max_update_id = last_id
 
     # Ensure Whisper is available before processing any voice messages
     has_voice = any(
@@ -181,8 +185,9 @@ def main():
                 f.write(entry)
             n_ideas += 1
 
-    if updates:
-        save_offset(max_update_id + 1)
+    if updates and max_update_id > last_id:
+        save_last_update_id(max_update_id)
+        print(f"   💾 Сохранён last_update_id: {max_update_id}")
 
     print(f"\n✅ Обработано обновлений: {len(updates)}")
     print(f"   🎙️  Голосовых расшифровано: {n_voice}")

@@ -1,3 +1,4 @@
 .offset
+.last_update_id
 __pycache__/
 *.pyc

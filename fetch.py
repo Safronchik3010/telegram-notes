@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
 telegram-notes / fetch.py
-Fetches text AND voice messages from Telegram bot.
-Voice messages are transcribed locally via Whisper.
+Fetches messages from the backend API (no direct Telegram access).
+Voice messages are downloaded via backend proxy and transcribed with Whisper.
 Classifies messages as IDEA or TASK, appends to ideas.md / tasks.md.
 """
 
-import os
 import json
-import sys
+import os
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
-TASKS_FILE       = BASE_DIR / "tasks.md"
-IDEAS_FILE       = BASE_DIR / "ideas.md"
-LAST_UPDATE_FILE = BASE_DIR / ".last_update_id"
+# ── Config ───────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).parent
+TASKS_FILE = BASE_DIR / "tasks.md"
+IDEAS_FILE = BASE_DIR / "ideas.md"
+
+BACKEND_URL  = os.environ.get(
+    "TELEGRAM_NOTES_BACKEND",
+    "https://telegram-notes-backend-production.up.railway.app",
+).rstrip("/")
+
+# Cursor stored outside the repo so it persists across runs
+CURSOR_FILE = Path(os.environ.get("TELEGRAM_NOTES_CURSOR", Path.home() / ".telegram-notes-cursor"))
 
 TASK_KEYWORDS = {
     "сделать", "купить", "написать", "позвонить", "отправить",
@@ -27,175 +34,148 @@ TASK_KEYWORDS = {
     "напомнить", "todo", "task",
 }
 
-# ── Whisper setup ────────────────────────────────────────────────────────────
+# ── Cursor ───────────────────────────────────────────────────────────────────
+def load_since_id() -> int:
+    if CURSOR_FILE.exists():
+        try:
+            return int(CURSOR_FILE.read_text().strip())
+        except ValueError:
+            pass
+    return 0
+
+def save_since_id(since_id: int):
+    CURSOR_FILE.write_text(str(since_id))
+
+# ── Backend API ───────────────────────────────────────────────────────────────
+def fetch_messages(since_id: int) -> list:
+    url = f"{BACKEND_URL}/messages?since_id={since_id}&limit=500"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+        return data.get("messages", [])
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Backend unavailable ({BACKEND_URL}): {e}")
+
+def download_voice(file_id: str) -> str:
+    """Download voice via backend proxy, return path to temp file."""
+    url = f"{BACKEND_URL}/voice/{file_id}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            tmp.write(r.read())
+    finally:
+        tmp.close()
+    return tmp.name
+
+# ── Whisper ───────────────────────────────────────────────────────────────────
 def ensure_whisper():
-    """Install openai-whisper locally if not available."""
     try:
         import whisper  # noqa
-        return True
     except ImportError:
-        print("⏳ Whisper не найден — устанавливаю локально...")
+        print("Whisper не найден — устанавливаю...")
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "openai-whisper", "--quiet"]
         )
-        print("✅ Whisper установлен.")
-        return True
 
 def transcribe_audio(file_path: str) -> str:
-    """Transcribe audio file using local Whisper model."""
     import whisper
-    print(f"🎙️  Расшифровываю аудио через Whisper (может занять ~1 мин при первом запуске)...")
+    print(f"  Расшифровываю через Whisper...")
     model = whisper.load_model("base")
-    result = model.transcribe(file_path, language=None)  # auto-detect language
+    result = model.transcribe(file_path, language=None)
     text = result.get("text", "").strip()
-    print(f"📝 Расшифровано: {text[:80]}{'...' if len(text) > 80 else ''}")
+    print(f"  Результат: {text[:80]}{'...' if len(text) > 80 else ''}")
     return text
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def get_token() -> str:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set in environment")
-    return token
-
-def load_last_update_id() -> int:
-    """Read last processed update_id from .last_update_id file."""
-    if LAST_UPDATE_FILE.exists():
-        return int(LAST_UPDATE_FILE.read_text().strip())
-    return 0
-
-def save_last_update_id(update_id: int):
-    """Save last processed update_id so next run skips already-seen messages."""
-    LAST_UPDATE_FILE.write_text(str(update_id))
-
-def fetch_updates(token: str, offset: int) -> list:
-    url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=5"
-    with urllib.request.urlopen(url, timeout=15) as r:
-        data = json.loads(r.read())
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data["result"]
-
-def download_voice(token: str, file_id: str) -> str:
-    """Download voice message, return path to temp .ogg file."""
-    # Step 1: get file path
-    url = f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
-    with urllib.request.urlopen(url, timeout=10) as r:
-        info = json.loads(r.read())
-    file_path = info["result"]["file_path"]
-
-    # Step 2: download file to temp location
-    download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-    suffix = Path(file_path).suffix or ".ogg"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    with urllib.request.urlopen(download_url, timeout=30) as r:
-        tmp.write(r.read())
-    tmp.close()
-    return tmp.name
-
+# ── Classification & formatting ───────────────────────────────────────────────
 def is_task(text: str) -> bool:
     words = text.lower().split()
     return any(w in TASK_KEYWORDS for w in words)
 
-def format_entry(text: str, ts: int, source: str = "text") -> str:
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+def format_entry(text: str, created_at: str, source: str = "text") -> str:
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        ts = dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        ts = created_at[:16] if created_at else "unknown"
     tag = "🎙️ " if source == "voice" else ""
-    return f"- [{dt}] {tag}{text}\n"
+    return f"- [{ts}] {tag}{text}\n"
 
 def ensure_file(path: Path, header: str):
     if not path.exists():
         path.write_text(f"# {header}\n\n")
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     ensure_file(TASKS_FILE, "Задачи")
-    ensure_file(IDEAS_FILE,  "Идеи")
+    ensure_file(IDEAS_FILE, "Идеи")
 
-    token         = get_token()
-    last_id       = load_last_update_id()
-    # Telegram API: offset = last_update_id + 1 → returns only NEW messages
-    offset        = last_id + 1 if last_id > 0 else 0
-    updates       = fetch_updates(token, offset)
+    since_id = load_since_id()
+    print(f"Запрашиваю сообщения с id > {since_id}...")
 
-    n_tasks       = 0
-    n_ideas       = 0
-    n_voice       = 0
-    n_skip        = 0
-    max_update_id = last_id
+    messages = fetch_messages(since_id)
+    print(f"Получено: {len(messages)} сообщений")
 
-    # Ensure Whisper is available before processing any voice messages
-    has_voice = any(
-        (upd.get("message") or upd.get("channel_post") or {}).get("voice")
-        for upd in updates
-    )
-    if has_voice:
+    if not messages:
+        print("Новых заметок нет.")
+        return
+
+    # Pre-check for voice to load Whisper once
+    if any(m.get("voice_file_id") for m in messages):
         ensure_whisper()
 
-    for upd in updates:
-        update_id = upd["update_id"]
-        max_update_id = max(max_update_id, update_id)
+    n_tasks = 0
+    n_ideas = 0
+    n_voice = 0
+    max_id  = since_id
 
-        msg = upd.get("message") or upd.get("channel_post")
-        if not msg:
-            continue
+    for msg in messages:
+        msg_id    = msg["id"]
+        max_id    = max(max_id, msg_id)
+        text      = msg.get("text") or ""
+        file_id   = msg.get("voice_file_id")
+        created   = msg.get("created_at", "")
+        source    = "text"
 
-        ts     = msg.get("date", 0)
-        text   = None
-        source = "text"
-
-        # ── Text message ────────────────────────────────────────────────────
-        if msg.get("text"):
-            text = msg["text"]
-
-        # ── Voice message ────────────────────────────────────────────────────
-        elif msg.get("voice"):
-            voice    = msg["voice"]
-            file_id  = voice["file_id"]
-            print(f"🎙️  Голосовое сообщение (file_id: {file_id[:20]}...)")
+        # Voice message — download and transcribe
+        if file_id and not text:
+            print(f"  Голосовое (file_id: {file_id[:20]}...)")
             try:
-                tmp_path = download_voice(token, file_id)
+                tmp_path = download_voice(file_id)
                 text     = transcribe_audio(tmp_path)
                 source   = "voice"
                 n_voice += 1
             except Exception as e:
-                print(f"⚠️  Не удалось расшифровать голосовое: {e}")
+                print(f"  Ошибка голосового: {e}")
+                continue
             finally:
                 try:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
 
-        # ── Other types (photo, sticker, etc.) ──────────────────────────────
-        else:
-            n_skip += 1
-            continue
-
         if not text:
-            n_skip += 1
             continue
 
-        entry = format_entry(text, ts, source)
+        entry = format_entry(text, created, source)
 
         if is_task(text):
-            with open(TASKS_FILE, "a", encoding="utf-8") as f:
+            with open(TASKS_FILE, "a") as f:
                 f.write(entry)
             n_tasks += 1
         else:
-            with open(IDEAS_FILE, "a", encoding="utf-8") as f:
+            with open(IDEAS_FILE, "a") as f:
                 f.write(entry)
             n_ideas += 1
 
-    if updates and max_update_id > last_id:
-        save_last_update_id(max_update_id)
-        print(f"   💾 Сохранён last_update_id: {max_update_id}")
+    save_since_id(max_id)
 
-    print(f"\n✅ Обработано обновлений: {len(updates)}")
-    print(f"   🎙️  Голосовых расшифровано: {n_voice}")
-    print(f"   📋 Задач добавлено:         {n_tasks}")
-    print(f"   💡 Идей добавлено:          {n_ideas}")
-    if n_skip:
-        print(f"   ⏭️  Пропущено (фото/стикеры): {n_skip}")
-    return n_tasks, n_ideas
+    print(f"\nГотово:")
+    print(f"  Задач:  {n_tasks}")
+    print(f"  Идей:   {n_ideas}")
+    if n_voice:
+        print(f"  Голосовых расшифровано: {n_voice}")
+    print(f"  Курсор сохранён: {max_id} → {CURSOR_FILE}")
+
 
 if __name__ == "__main__":
     main()
